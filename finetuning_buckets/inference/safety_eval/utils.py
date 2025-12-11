@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
 import matplotlib.pyplot as plt
 from typing import Optional, List, Tuple
 from torch.utils.data import Dataset
@@ -18,6 +19,17 @@ class ConversationDataset(Dataset):
     
     def __getitem__(self, idx):
         return self.data_list[idx]
+def serialize(x):
+    if isinstance(x, torch.Tensor):
+        return x.tolist()  
+    elif isinstance(x, (int, float, str, bool)) or x is None:
+        return x
+    elif isinstance(x, dict):
+        return {k: serialize(v) for k, v in x.items()}
+    elif isinstance(x, (list, tuple)):
+        return [serialize(v) for v in x]
+    else:
+        return str(x) 
 
 def calculate_diversity(vecs: torch.Tensor) -> torch.Tensor:
     """Compute a simple diversity metric over vectors.
@@ -84,6 +96,54 @@ def visualize_diversity(
     plt.savefig(out_path)
     plt.close()
 
+def k_means(vecs: torch.Tensor, k: int, out_path: Optional[str] = None, save_results: bool = False, inits: int = 10, iters: int = 100) -> List[List[int]]:
+    """
+        do k-means clustering to a set of vectors.
+        shape: [N, num_hiddens]
+        return the clustered indices of the data.
+        save_path should be the directory.
+    """
+    n = vecs.shape[0]
+    vecs_np = vecs.detach().cpu().numpy()
+    kmeans = KMeans(
+        n_clusters=k,
+        n_init=inits,
+        max_iter=iters
+    )
+    labels = kmeans.fit_predict(vecs_np)
+
+    cluster_to_indices = {int(c): [] for c in range(k)}
+    for vec_idx, label in zip(n.tolist(), labels.tolist()):
+        cluster_to_indices[int(label)].append(int(vec_idx))
+
+    # calculate diversity of each split
+    sims = []
+    for i in len(k):
+        cluster_vecs = [vecs[cluster_to_indices[i][j]] for j in range(len(cluster_to_indices[i]))]
+        cluster_vecs = torch.stack(cluster_vecs, dim=0)
+        sims.append(calculate_diversity(cluster_vecs))
+    
+    if out_path is not None:
+        # visualize the data
+        figure_path = os.path.join(out_path, f"k_means_samples{n}.png")
+        vec_comb = [(vecs[i], labels[i]) for i in range(n)]
+        visualize_diversity(vecs_set=vec_comb, out_path=figure_path)
+        print(f"Saved kmeans figure to {figure_path}")
+        if save_results:
+            cluster_pt_path = os.path.join(out_path, f"clusters_samples{n}.pt")
+            torch.save(
+                {
+                    "k": l,
+                    "cluster_labels": torch.as_tensor(labels),
+                    "cluster_to_indices": cluster_to_indices,
+                    "sims": torch.as_tensor(sims),
+                    "kmeans_centers": torch.from_numpy(kmeans.cluster_centers_),
+                },
+                cluster_pt_path,
+            )
+            print(f"Saved clustered result to {cluster_pt_path}")
+    
+    return cluster_to_indices
 
 
 
