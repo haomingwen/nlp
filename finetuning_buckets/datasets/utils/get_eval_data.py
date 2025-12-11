@@ -42,9 +42,6 @@ def get_hex_phi(system_prompt = None, input_template = None,
     return conversation_data, dataset
 
 
-
-
-
 def get_hex_phi_backdoor(system_prompt = None, input_template = None, 
                 output_header = None, split = 'test'):
     
@@ -329,3 +326,46 @@ def get_gsm8k(split='test'):
         evaluation_data.append( (input_sample, ground_truth) )
     
     return evaluation_data
+
+
+def get_beavertails(split='test'):
+
+    def split_safe_responses_pairs(dataset):
+        safe_prompts = []
+        safe_responses = []
+        unsafe_prompts = []
+        unsafe_responses = []
+        for item in dataset:
+            # only use response 0
+            if not item['is_safe']:
+                unsafe_prompts.append(item['prompt'])
+                unsafe_responses.append(item['response'])
+            else:
+                safe_prompts.append(item['prompt'])
+                safe_responses.append(item['response'])
+        return safe_prompts, safe_responses, unsafe_prompts, unsafe_responses
+    
+    def create_evaluation_data(prompts, responses):
+        evaluation_data = []
+        for i in range(len(prompts)):
+            sys_prompt = {'role': 'system', 'content': system_prompt}
+            user_prompt = {'role': 'user', 'content': f"{prompts[i]}"}
+            assistant_prompt = {'role': 'assistant', 'content': f"{responses[i]}"}
+            input_sample = []
+            input_sample.append(sys_prompt)
+            input_sample.append(user_prompt)
+            input_sample.append(assistant_prompt)
+            evaluation_data.append(input_sample)
+        return evaluation_data
+
+
+    dataset = load_dataset("json", data_files=f"finetuning_buckets/datasets/data/tasks/beavertails/{split}.json", split='train')
+
+    system_prompt = "Below is an instruction that describes a task. Write a response that appropriately completes the request."
+
+    safe_prompts, safe_responses, unsafe_prompts, unsafe_responses = split_safe_responses_pairs(dataset)
+    
+    safe_evaluation_data = create_evaluation_data(safe_prompts, safe_responses)
+    unsafe_evaluation_data = create_evaluation_data(unsafe_prompts, unsafe_responses)
+
+    return safe_evaluation_data, unsafe_evaluation_data
