@@ -31,7 +31,7 @@ def serialize(x):
     else:
         return str(x) 
 
-def calculate_diversity(vecs: torch.Tensor) -> torch.Tensor:
+def calculate_diversity(vecs: torch.Tensor, use_abs: bool = True) -> torch.Tensor:
     """Compute a simple diversity metric over vectors.
 
     shape: (num_vecs, hidden_dims)
@@ -40,16 +40,19 @@ def calculate_diversity(vecs: torch.Tensor) -> torch.Tensor:
     n = vecs.shape[0]
     if n < 2:
         return torch.tensor(0.0)
-
     for i in range(n):
         for j in range(i + 1, n):
-            diversity += torch.abs(torch.dot(vecs[i], vecs[j]))
+            if use_abs:
+                diversity += torch.abs(torch.dot(vecs[i], vecs[j]))
+            else:
+                diversity += torch.dot(vecs[i], vecs[j])
 
     diversity = diversity / (n * (n - 1) / 2)
     return diversity
 
 def visualize_diversity(
     vecs_set: List[Tuple[torch.Tensor, str]],
+    set_num: int,
     out_path: str = "diversity.png",
     pca_dim: int = 2,
 ) -> None:
@@ -59,6 +62,7 @@ def visualize_diversity(
     Args:
         vecs_set: list of (tensor, label_str).
                   Each tensor shape: (N_i, D), all D must be the same.
+        set_num: the total categories of labels.
         out_path: path to save the figure.
         pca_dim:  PCA dimension (must be >= 2 if you want 2D scatter).
     """
@@ -71,12 +75,18 @@ def visualize_diversity(
         import shutil
         shutil.rmtree(out_path)
 
-    # 每组大小
-    set_sizes = [t.shape[0] for (t, _) in vecs_set]
+    # create an empty bin for classification
+    vec_bins = [torch.empty(0, vecs_set[0][0].shape[-1]) for i in range(set_num)]
+    for vecs in vecs_set:
+        vec, label = vecs
+        vec = vec.unsqueeze(0)
+        label = int(label)
+        vec_bins[label] = torch.cat((vec_bins[label], vec), dim=0)
+    set_sizes = [len(vec_bins[i]) for i in range(set_num)]
 
     # 转成 numpy 并拼接
-    all_vecs_np = [t.detach().cpu().numpy() for (t, _) in vecs_set]
-    all_np = np.concatenate(all_vecs_np, axis=0)  # (sum N_i, D)
+    vec_bins = torch.cat(vec_bins, dim=0)
+    all_np = vec_bins.detach().cpu().numpy()
 
     # PCA
     pca = PCA(n_components=pca_dim)
@@ -85,9 +95,9 @@ def visualize_diversity(
     # 画图
     plt.figure()
     tot = 0
-    for (size, (_, label)) in zip(set_sizes, vecs_set):
+    for (i, size) in enumerate(set_sizes):
         cur_pca = all_pca[tot:tot + size]
-        plt.scatter(cur_pca[:, 0], cur_pca[:, 1], alpha=0.7, label=label)
+        plt.scatter(cur_pca[:, 0], cur_pca[:, 1], alpha=0.7, label=i)
         tot += size
 
     plt.legend()
@@ -113,12 +123,12 @@ def k_means(vecs: torch.Tensor, k: int, out_path: Optional[str] = None, save_res
     labels = kmeans.fit_predict(vecs_np)
 
     cluster_to_indices = {int(c): [] for c in range(k)}
-    for vec_idx, label in zip(n.tolist(), labels.tolist()):
+    for vec_idx, label in zip([i for i in range(n)], labels.tolist()):
         cluster_to_indices[int(label)].append(int(vec_idx))
 
     # calculate diversity of each split
     sims = []
-    for i in len(k):
+    for i in range(k):
         cluster_vecs = [vecs[cluster_to_indices[i][j]] for j in range(len(cluster_to_indices[i]))]
         cluster_vecs = torch.stack(cluster_vecs, dim=0)
         sims.append(calculate_diversity(cluster_vecs))
@@ -127,13 +137,13 @@ def k_means(vecs: torch.Tensor, k: int, out_path: Optional[str] = None, save_res
         # visualize the data
         figure_path = os.path.join(out_path, f"k_means_samples{n}.png")
         vec_comb = [(vecs[i], labels[i]) for i in range(n)]
-        visualize_diversity(vecs_set=vec_comb, out_path=figure_path)
+        visualize_diversity(vecs_set=vec_comb, set_num=k, out_path=figure_path)
         print(f"Saved kmeans figure to {figure_path}")
         if save_results:
             cluster_pt_path = os.path.join(out_path, f"clusters_samples{n}.pt")
             torch.save(
                 {
-                    "k": l,
+                    "k": k,
                     "cluster_labels": torch.as_tensor(labels),
                     "cluster_to_indices": cluster_to_indices,
                     "sims": torch.as_tensor(sims),
