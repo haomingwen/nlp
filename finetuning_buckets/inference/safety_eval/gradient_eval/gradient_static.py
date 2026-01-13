@@ -11,49 +11,32 @@ import sys
 
 import torch
 import torch.nn as nn
-import numpy as np
+import torch.distributed as dist
 from torch.utils.data import DataLoader
-from sklearn.decomposition import PCA
-import matplotlib.pyplot as plt
-from trak.projectors import BasicProjector, CudaProjector, ProjectionType
+from torch.utils.data.distributed import DistributedSampler
+from trak.projectors import CudaProjector, ProjectionType
 import torch.nn.functional as F
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from tqdm.auto import tqdm
-from typing import Optional
+from typing import Optional, Callable, Tuple
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.abspath(os.path.join(script_dir, '../../../../'))
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 from finetuning_buckets.datasets.utils.get_eval_data import get_beavertails
-
-
-def get_trak_projector(device: torch.device = torch.device("cuda:0")):
-    """Select CUDA or basic projector depending on fast_jl availability."""
-    try:
-        num_sms = torch.cuda.get_device_properties(device.index).multi_processor_count
-        import fast_jl
-
-        # test run to catch at init time if projection goes through
-        fast_jl.project_rademacher_8(torch.zeros(8, 1_000, device=device), 512, 0, num_sms)
-        projector = CudaProjector
-        print("Using CudaProjector")
-    except Exception:
-        projector = BasicProjector
-        print("Using BasicProjector")
-    return projector
-
-def calc_loss(batch, outputs, tokenizer=None):
-    labels = batch['labels']
-    labels = labels[:, 1:].clone()
-    if tokenizer is not None:
-        labels[labels == tokenizer.pad_token_id] = -100
-    logits = outputs.logits[:, :-1, :]
-
-    loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), labels.reshape(-1), ignore_index=-100)
-    return loss
+from finetuning_buckets.datasets.utils.collate import make_collate_fn
+from finetuning_buckets.inference.safety_eval.utils import (
+    ConversationDataset,
+    calculate_diversity,
+    visualize_diversity,
+)
+from finetuning_buckets.inference.safety_eval.gradient_eval.gradient_utils import (
+    get_trak_projector,
+    get_fastjl_projector,
+)
 
 def obtain_gradients(model: nn.Module, tokenizer: AutoTokenizer, batch: dict) -> torch.Tensor:
     """Compute full parameter gradients for a single batch and return a flat CPU vector.
@@ -83,12 +66,89 @@ def obtain_gradients(model: nn.Module, tokenizer: AutoTokenizer, batch: dict) ->
     return vectorized_grads
 
 
-def get_full_project_gradient(eval_dataloader: DataLoader, model: nn.Module, tokenizer: AutoTokenizer, project_interval: int = 10, proj_dim: int = 8192, dtype: torch.dtype = torch.float16, block_size: int = 1) -> torch.Tensor:
+def _init_distributed() -> Tuple[bool, int, int, int]:
+    if not dist.is_available():
+        return False, 0, 1, 0
+
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size <= 1:
+        return False, 0, 1, 0
+
+    if not dist.is_initialized():
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend)
+
+    rank = dist.get_rank()
+    local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+
+    return True, rank, world_size, local_rank
+
+
+def _gather_projected(
+    projected: torch.Tensor,
+    rank: int,
+    world_size: int,
+) -> Optional[torch.Tensor]:
+    if not dist.is_initialized():
+        return projected
+
+    backend = dist.get_backend()
+    if backend == "nccl":
+        gather_device = torch.device("cuda", torch.cuda.current_device())
+    else:
+        gather_device = torch.device("cpu")
+
+    projected = projected.to(gather_device)
+    local_size = torch.tensor([projected.shape[0]], device=gather_device, dtype=torch.long)
+    size_list = [torch.zeros_like(local_size) for _ in range(world_size)]
+    dist.all_gather(size_list, local_size)
+    max_size = int(max(s.item() for s in size_list))
+
+    if projected.shape[0] < max_size:
+        pad = torch.zeros(
+            (max_size - projected.shape[0], projected.shape[1]),
+            device=gather_device,
+            dtype=projected.dtype,
+        )
+        projected = torch.cat([projected, pad], dim=0)
+
+    gather_list = [torch.zeros_like(projected) for _ in range(world_size)]
+    dist.all_gather(gather_list, projected)
+
+    if rank != 0:
+        return None
+
+    gathered = []
+    for tensor, size in zip(gather_list, size_list):
+        gathered.append(tensor[: int(size.item())].cpu())
+    return torch.cat(gathered, dim=0)
+
+
+def get_full_project_gradient(
+    eval_dataloader: DataLoader,
+    model: nn.Module,
+    tokenizer: AutoTokenizer,
+    project_interval: int = 10,
+    proj_dim: int = 8192,
+    dtype: torch.dtype = torch.float16,
+    block_size: int = 1,
+    projector_type: str = "trak",
+    gather_to_rank0: bool = True,
+) -> Optional[torch.Tensor]:
     """Compute gradients for several batches and stack them."""
     gradients_list = []
     projected_gradients = []
-    device = "cuda:0"
-    projector_cls = get_trak_projector(device=device)
+    device = next(model.parameters()).device
+    projector_cls = None
+    fastjl_projector = None
+    if projector_type == "trak":
+        projector_cls = get_trak_projector(device=device)
+    elif projector_type == "fastjl":
+        fastjl_projector = get_fastjl_projector(device=device)
+    else:
+        raise ValueError(f"Unknown projector_type: {projector_type}")
 
     for i, batch in enumerate(
         tqdm(eval_dataloader, total=len(eval_dataloader), desc="Collecting gradients"),
@@ -102,32 +162,60 @@ def get_full_project_gradient(eval_dataloader: DataLoader, model: nn.Module, tok
                 current_gradient = torch.stack(gradients_list, dim=0)  # (project_interval, num_params)
             else:
                 current_gradient = torch.empty(0, device=device)
-            projected_gradient = project_gradient(current_gradient, projector_cls=projector_cls, proj_dim=proj_dim, device=device, dtype=dtype, block_size=block_size)
+            projected_gradient = project_gradient(
+                current_gradient,
+                projector_cls=projector_cls,
+                proj_dim=proj_dim,
+                device=device,
+                dtype=dtype,
+                block_size=block_size,
+                projector_type=projector_type,
+                fastjl_projector=fastjl_projector,
+            )
             projected_gradients.append(projected_gradient.cpu())
 
             gradients_list = []
 
-    projected_gradients = torch.stack(projected_gradients, dim=0)   
-    projected_gradients = projected_gradients.reshape(-1, projected_gradients.size(-1))
+    if not projected_gradients:
+        projected_gradients = torch.empty(0, proj_dim)
+    else:
+        projected_gradients = torch.stack(projected_gradients, dim=0)
+        projected_gradients = projected_gradients.reshape(-1, projected_gradients.size(-1))
     # normalize gradients again
     normalized_gradients = F.normalize(projected_gradients, p=2, dim=-1)
+
+    if dist.is_initialized() and gather_to_rank0:
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        return _gather_projected(normalized_gradients, rank, world_size)
 
     return normalized_gradients
 
 
 def project_gradient(
     gradient: torch.Tensor,
-    projector_cls: CudaProjector,
+    projector_cls: Optional[CudaProjector],
     proj_dim: int,
     device: torch.device,
     dtype: torch.dtype,
     block_size: int,
+    projector_type: str = "trak",
+    fastjl_projector: Optional[Callable[[torch.Tensor, int, int], torch.Tensor]] = None,
 ) -> torch.Tensor:
     """Project high-dimensional gradient matrix to lower dimension with TRAK projector.
 
     gradient: (num_batches, num_params)
     returns: (num_batches, proj_dim) on CPU
     """
+    if projector_type == "fastjl":
+        if fastjl_projector is None:
+            raise ValueError("fastjl_projector is required when projector_type='fastjl'")
+        gradient = gradient.to(device=device, dtype=dtype)
+        projected = fastjl_projector(gradient, proj_dim, 0)
+        return projected.cpu()
+
+    if projector_cls is None:
+        raise ValueError("projector_cls is required when projector_type='trak'")
     proj = projector_cls(
         grad_dim=gradient.shape[1],
         proj_dim=proj_dim,
@@ -143,66 +231,6 @@ def project_gradient(
     return projected.cpu()
 
 
-def calculate_diversity(projected_gradients: torch.Tensor) -> torch.Tensor:
-    """Compute a simple diversity metric over projected gradients.
-
-    projected_gradients: (num_batches, proj_dim)
-    """
-    diversity = 0.0
-    n = projected_gradients.shape[0]
-    if n < 2:
-        return torch.tensor(0.0)
-
-    for i in range(n):
-        for j in range(i + 1, n):
-            diversity += torch.abs(torch.dot(projected_gradients[i], projected_gradients[j]))
-
-    diversity = diversity / (n * (n - 1) / 2)
-    return diversity
-
-
-def visualize_diversity(projected_gradients_a: torch.Tensor, projected_gradients_b: Optional[torch.Tensor] = None, out_path: str = "diversity.png") -> None:
-    """Use PCA to reduce to 2D and save a scatter plot."""
-    # 确保输出路径的目录存在
-    out_dir = os.path.dirname(out_path)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-    
-    # 如果目标路径是一个已存在的目录，则删除它
-    if os.path.exists(out_path) and os.path.isdir(out_path):
-        import shutil
-        shutil.rmtree(out_path)
-    
-    if projected_gradients_b is None:
-        projected_np = projected_gradients_a.numpy()
-        pca = PCA(n_components=2)
-        pca.fit(projected_np)
-        projected_pca = pca.transform(projected_np)
-
-        plt.figure()
-        plt.scatter(projected_pca[:, 0], projected_pca[:, 1])
-        plt.savefig(out_path)
-        plt.close()
-        return
-    
-    a_np = projected_gradients_a.numpy()
-    b_np = projected_gradients_b.numpy()
-
-    all_np = np.concatenate([a_np, b_np], axis=0)
-
-    pca = PCA(n_components=2)
-    all_pca = pca.fit_transform(all_np)
-
-    n_a = a_np.shape[0]
-    a_pca = all_pca[:n_a]
-    b_pca = all_pca[n_a:]
-
-    plt.figure()
-    plt.scatter(a_pca[:, 0], a_pca[:, 1], alpha=0.7, label="A")
-    plt.scatter(b_pca[:, 0], b_pca[:, 1], alpha=0.7, label="B")
-    plt.legend()
-    plt.savefig(out_path)
-    plt.close()
 
 
 class GradientStaticEvaluator:
@@ -216,52 +244,79 @@ class GradientStaticEvaluator:
         self.dtype = torch.float16
 
     def init_engine(self):
+        is_dist, rank, world_size, local_rank = _init_distributed()
+        if is_dist:
+            device = torch.device("cuda", local_rank)
+        else:
+            device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_path,
             low_cpu_mem_usage=True,
             torch_dtype=self.dtype,
             offload_state_dict=True,
-            device_map="auto",
         )
+        self.model.to(device)
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
         self.tokenizer.pad_token = self.tokenizer.eos_token
 
     def evaluate(self):
-        from finetuning_buckets.inference.safety_eval.kl_eval.kl import (
-            make_collate_fn,
-            ConversationDataset,
-        )
-        from finetuning_buckets.datasets.utils.get_eval_data import get_beavertails
-
+        is_dist, rank, world_size, local_rank = _init_distributed()
         self.init_engine()
         self.model.train()
 
         # first project the unsafe data, then project the safe data
         safe_data, unsafe_data = get_beavertails(split="train")
         harmful_dataset = ConversationDataset(unsafe_data)
+        harmful_sampler = None
+        if is_dist:
+            harmful_sampler = DistributedSampler(harmful_dataset, shuffle=False)
 
         eval_dataloader = DataLoader(
             harmful_dataset,
             batch_size=1,
-            shuffle=False,
-            collate_fn=make_collate_fn(self.tokenizer, use_chat=False, mask_prompts=True),
+            shuffle=harmful_sampler is None,
+            sampler=harmful_sampler,
+            collate_fn=make_collate_fn(self.tokenizer, mask_prompts=True),
         )
-        unsafe_tot = len(eval_dataloader)
+        unsafe_tot = len(harmful_dataset)
         
-        full_gradient_unsafe = get_full_project_gradient(eval_dataloader, self.model, self.tokenizer, project_interval=5, proj_dim=self.proj_dim, dtype=self.dtype, block_size=self.block_size)
+        full_gradient_unsafe = get_full_project_gradient(
+            eval_dataloader,
+            self.model,
+            self.tokenizer,
+            project_interval=5,
+            proj_dim=self.proj_dim,
+            dtype=self.dtype,
+            block_size=self.block_size,
+        )
 
         safe_dataset = ConversationDataset(safe_data)
+        safe_sampler = None
+        if is_dist:
+            safe_sampler = DistributedSampler(safe_dataset, shuffle=False)
 
         eval_dataloader = DataLoader(
             safe_dataset,
             batch_size=1,
-            shuffle=False,
-            collate_fn=make_collate_fn(self.tokenizer, use_chat=False, mask_prompts=True),
+            shuffle=safe_sampler is None,
+            sampler=safe_sampler,
+            collate_fn=make_collate_fn(self.tokenizer, mask_prompts=True),
         )
-        safe_tot = len(eval_dataloader)
+        safe_tot = len(safe_dataset)
 
-        full_gradient_safe = get_full_project_gradient(eval_dataloader, self.model, self.tokenizer, project_interval=5, proj_dim=self.proj_dim, dtype=self.dtype, block_size=self.block_size)
+        full_gradient_safe = get_full_project_gradient(
+            eval_dataloader,
+            self.model,
+            self.tokenizer,
+            project_interval=5,
+            proj_dim=self.proj_dim,
+            dtype=self.dtype,
+            block_size=self.block_size,
+        )
+
+        if is_dist and rank != 0:
+            return
         
         full_gradient = torch.cat((full_gradient_unsafe, full_gradient_safe), dim=0)
 
@@ -271,7 +326,11 @@ class GradientStaticEvaluator:
         print(f"unsafe_diversity: {unsafe_diversity}")
 
         output_path = os.path.join(self.out_path, f"diversity_samples_{unsafe_tot + safe_tot}.png")
-        visualize_diversity(full_gradient_unsafe, full_gradient_safe, out_path=output_path)
+        visualize_diversity(
+            projected_gradients_a=full_gradient_unsafe,
+            projected_gradients_b=full_gradient_safe,
+            out_path=output_path,
+        )
 
         # store the results
         output_path = os.path.join(self.out_path, f"gradient_samples_unsafe_{unsafe_tot}.pt")
@@ -282,5 +341,5 @@ class GradientStaticEvaluator:
 
 
 if __name__ == "__main__":
-    evaluator = GradientStaticEvaluator(model_path="/root/autodl-tmp/qwen2-1.5b", out_path="finetuning_buckets/inference/safety_eval/gradient_eval/qwen2/beavertails/train")
+    evaluator = GradientStaticEvaluator(model_path="/root/autodl-tmp/qwen", out_path="finetuning_buckets/inference/safety_eval/gradient_eval/qwen2/beavertails")
     evaluator.evaluate()

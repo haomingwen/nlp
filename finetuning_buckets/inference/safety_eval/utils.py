@@ -51,20 +51,19 @@ def calculate_diversity(vecs: torch.Tensor, use_abs: bool = True) -> torch.Tenso
     return diversity
 
 def visualize_diversity(
-    vecs_set: List[Tuple[torch.Tensor, str]],
-    set_num: int,
+    vecs_set: Optional[List[Tuple[torch.Tensor, str]]] = None,
+    set_num: Optional[int] = None,
     out_path: str = "diversity.png",
     pca_dim: int = 2,
+    projected_gradients_a: Optional[torch.Tensor] = None,
+    projected_gradients_b: Optional[torch.Tensor] = None,
 ) -> None:
     """
-    Visualize multiple sets of vectors in a shared PCA space.
+    Visualize vectors in a shared PCA space.
 
-    Args:
-        vecs_set: list of (tensor, label_str).
-                  Each tensor shape: (N_i, D), all D must be the same.
-        set_num: the total categories of labels.
-        out_path: path to save the figure.
-        pca_dim:  PCA dimension (must be >= 2 if you want 2D scatter).
+    Modes:
+      1) Labeled vectors: pass vecs_set (optionally set_num).
+      2) Gradient sets: pass projected_gradients_a (and optionally projected_gradients_b).
     """
     assert pca_dim >= 2, "pca_dim must be at least 2 for 2D visualization."
 
@@ -75,27 +74,76 @@ def visualize_diversity(
         import shutil
         shutil.rmtree(out_path)
 
-    # create an empty bin for classification
-    vec_bins = [torch.empty(0, vecs_set[0][0].shape[-1]) for i in range(set_num)]
+    if projected_gradients_a is not None:
+        if projected_gradients_b is None:
+            projected_np = projected_gradients_a.detach().cpu().numpy()
+            pca = PCA(n_components=2)
+            projected_pca = pca.fit_transform(projected_np)
+
+            plt.figure()
+            plt.scatter(projected_pca[:, 0], projected_pca[:, 1])
+            plt.savefig(out_path)
+            plt.close()
+            return
+
+        a_np = projected_gradients_a.detach().cpu().numpy()
+        b_np = projected_gradients_b.detach().cpu().numpy()
+        all_np = np.concatenate([a_np, b_np], axis=0)
+
+        pca = PCA(n_components=2)
+        all_pca = pca.fit_transform(all_np)
+
+        n_a = a_np.shape[0]
+        a_pca = all_pca[:n_a]
+        b_pca = all_pca[n_a:]
+
+        plt.figure()
+        plt.scatter(a_pca[:, 0], a_pca[:, 1], alpha=0.7, label="A")
+        plt.scatter(b_pca[:, 0], b_pca[:, 1], alpha=0.7, label="B")
+        plt.legend()
+        plt.savefig(out_path)
+        plt.close()
+        return
+
+    if vecs_set is None:
+        raise ValueError("vecs_set is required when projected_gradients_a is not provided.")
+
+    label_to_idx = {}
+    if set_num is None:
+        for _, label in vecs_set:
+            if label not in label_to_idx:
+                label_to_idx[label] = len(label_to_idx)
+        set_num = len(label_to_idx)
+
+    vec_bins = [torch.empty(0, vecs_set[0][0].shape[-1]) for _ in range(set_num)]
     for vecs in vecs_set:
         vec, label = vecs
-        vec = vec.unsqueeze(0)
-        label = int(label)
-        vec_bins[label] = torch.cat((vec_bins[label], vec), dim=0)
-    set_sizes = [len(vec_bins[i]) for i in range(set_num)]
+        if label in label_to_idx:
+            label_idx = label_to_idx[label]
+        elif isinstance(label, (int, np.integer)) and 0 <= int(label) < set_num:
+            label_idx = int(label)
+        else:
+            if len(label_to_idx) >= set_num:
+                raise ValueError("set_num is smaller than the number of labels.")
+            label_to_idx[label] = len(label_to_idx)
+            label_idx = label_to_idx[label]
 
-    # 转成 numpy 并拼接
+        if vec.dim() == 1:
+            vec = vec.unsqueeze(0)
+        elif vec.dim() != 2:
+            raise ValueError("vecs_set tensors must be 1D or 2D.")
+        vec_bins[label_idx] = torch.cat((vec_bins[label_idx], vec), dim=0)
+
+    set_sizes = [len(vec_bins[i]) for i in range(set_num)]
     vec_bins = torch.cat(vec_bins, dim=0)
     all_np = vec_bins.detach().cpu().numpy()
 
-    # PCA
     pca = PCA(n_components=pca_dim)
     all_pca = pca.fit_transform(all_np)  # (sum N_i, pca_dim)
 
-    # 画图
     plt.figure()
     tot = 0
-    for (i, size) in enumerate(set_sizes):
+    for i, size in enumerate(set_sizes):
         cur_pca = all_pca[tot:tot + size]
         plt.scatter(cur_pca[:, 0], cur_pca[:, 1], alpha=0.7, label=i)
         tot += size
@@ -156,6 +204,79 @@ def k_means(vecs: torch.Tensor, k: int, out_path: Optional[str] = None, save_res
     return cluster_to_indices
 
 
+def _compute_weighted_center(
+    centers: torch.Tensor,
+    cluster_sizes: dict,
+    cluster_ids: List[int],
+) -> torch.Tensor:
+    sizes = torch.tensor([cluster_sizes[i] for i in cluster_ids], dtype=centers.dtype, device=centers.device)
+    total = sizes.sum()
+    if total == 0:
+        return centers[cluster_ids].mean(dim=0)
+    return (centers[cluster_ids] * sizes[:, None]).sum(dim=0) / total
+
+
+def merge_kmeans_splits(
+    cluster_to_indices: dict,
+    kmeans_centers: torch.Tensor,
+    merge_sizes: Optional[List[int]] = None,
+    start_cluster: Optional[int] = None,
+    max_merged_size: Optional[int] = 10000,
+) -> Tuple[List[int], dict]:
+    """
+    Merge clusters into cumulative splits (e.g., sizes 1/2/4/8) by nearest-center order.
+
+    Returns:
+      ordered_clusters: the chosen cluster ordering
+      merged_splits: dict[size] -> merged indices list for the first `size` clusters
+    """
+    if merge_sizes is None:
+        merge_sizes = [1, 2, 4, 8]
+    merge_sizes = sorted(set(merge_sizes))
+
+    if not torch.is_tensor(kmeans_centers):
+        kmeans_centers = torch.as_tensor(kmeans_centers)
+
+    k = kmeans_centers.shape[0]
+    max_size = merge_sizes[-1]
+    if max_size > k:
+        raise ValueError(f"merge size {max_size} exceeds number of clusters {k}")
+
+    cluster_sizes = {int(i): len(cluster_to_indices[i]) for i in range(k)}
+
+    if start_cluster is None:
+        overall_center = kmeans_centers.mean(dim=0)
+        dists = torch.norm(kmeans_centers - overall_center, dim=1)
+        start_cluster = int(torch.argmin(dists).item())
+
+    ordered = [start_cluster]
+    remaining = set(range(k)) - {start_cluster}
+    current_center = _compute_weighted_center(kmeans_centers, cluster_sizes, ordered)
+
+    while len(ordered) < max_size:
+        remaining_list = sorted(remaining)
+        candidate_centers = kmeans_centers[remaining_list]
+        dists = torch.norm(candidate_centers - current_center, dim=1)
+        next_idx = remaining_list[int(torch.argmin(dists).item())]
+        ordered.append(next_idx)
+        remaining.remove(next_idx)
+        current_center = _compute_weighted_center(kmeans_centers, cluster_sizes, ordered)
+
+    merged_splits = {}
+    for size in merge_sizes:
+        per_cluster_limit = None
+        if max_merged_size is not None:
+            per_cluster_limit = max_merged_size // size
+        merged = []
+        for cluster_id in ordered[:size]:
+            cluster_indices = cluster_to_indices[cluster_id]
+            if per_cluster_limit is not None:
+                merged.extend(cluster_indices[:per_cluster_limit])
+            else:
+                merged.extend(cluster_indices)
+        merged_splits[size] = merged
+
+    return ordered, merged_splits
 
 
     

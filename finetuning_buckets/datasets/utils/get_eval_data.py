@@ -328,7 +328,7 @@ def get_gsm8k(split='test'):
     return evaluation_data
 
 
-def get_beavertails(split='test'):
+def get_beavertails(split='train'):
 
     def split_safe_responses_pairs(dataset):
         safe_prompts = []
@@ -359,7 +359,7 @@ def get_beavertails(split='test'):
         return evaluation_data
 
 
-    dataset = load_dataset("json", data_files=f"finetuning_buckets/datasets/data/tasks/beavertails/{split}.json", split='train')
+    dataset = load_dataset("json", data_files=f"finetuning_buckets/datasets/data/beavertails/{split}.json", split='train')
 
     system_prompt = "Below is an instruction that describes a task. Write a response that appropriately completes the request."
 
