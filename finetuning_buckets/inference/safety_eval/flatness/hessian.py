@@ -56,15 +56,15 @@ def load_model_and_tokenizer(
     return model, tokenizer
 
 
-def build_dataloader(tokenizer: AutoTokenizer, split: str, use_unsafe: bool) -> DataLoader:
+def build_dataloader(tokenizer: AutoTokenizer, split: str, use_unsafe: bool, batch_size: int = 1) -> DataLoader:
     safe_data, unsafe_data = get_beavertails(split=split)
     data = unsafe_data if use_unsafe else safe_data
     dataset = ConversationDataset(data)
     return DataLoader(
         dataset,
         batch_size=1,
-        shuffle=True,
-        collate_fn=make_collate_fn(tokenizer, mask_prompts=True),
+        shuffle=False,
+        collate_fn=make_collate_fn(tokenizer, mask_prompts=True, model_name="qwen"),
     )
 
 

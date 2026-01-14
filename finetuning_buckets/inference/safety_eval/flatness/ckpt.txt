@@ -1,0 +1,10 @@
+/root/autodl-tmp/LlamaFactory/saves/instruct/checkpoint-10
+/root/autodl-tmp/LlamaFactory/saves/instruct/checkpoint-20
+/root/autodl-tmp/LlamaFactory/saves/instruct/checkpoint-30
+/root/autodl-tmp/LlamaFactory/saves/instruct/checkpoint-40
+/root/autodl-tmp/LlamaFactory/saves/instruct/checkpoint-50
+
+
+
+
+

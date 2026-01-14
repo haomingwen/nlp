@@ -4,7 +4,7 @@ import sys
 import torch
 import torch.nn as nn
 import numpy as np
-from sklearn.decomposition import PCA
+from sklearn.decomposition import PCA, IncrementalPCA
 from sklearn.cluster import KMeans
 import matplotlib.pyplot as plt
 from typing import Optional, List, Tuple
@@ -19,6 +19,7 @@ class ConversationDataset(Dataset):
     
     def __getitem__(self, idx):
         return self.data_list[idx]
+
 def serialize(x):
     if isinstance(x, torch.Tensor):
         return x.tolist()  

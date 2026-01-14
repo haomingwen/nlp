@@ -39,26 +39,28 @@ def _format_messages_fallback(messages: List[Dict[str, Any]]) -> str:
     return "\n".join(parts)
 
 
-def _build_text(tokenizer, messages: List[Dict[str, Any]], use_chat: bool) -> str:
-    if use_chat and hasattr(tokenizer, "apply_chat_template"):
+def _build_text(tokenizer, messages: List[Dict[str, Any]], use_template: bool) -> str:
+    if use_template and hasattr(tokenizer, "apply_chat_template"):
         return _format_messages_with_template(tokenizer, messages, add_generation_prompt=False)
     return _format_messages_fallback(messages)
 
 
-def _build_prompt_text(tokenizer, messages: List[Dict[str, Any]], use_chat: bool) -> str:
+def _build_prompt_text_qwen(tokenizer, messages: List[Dict[str, Any]], use_template: bool) -> str:
     prompt_messages = [dict(m) for m in messages]
     if prompt_messages and prompt_messages[-1].get("role") == "assistant":
         prompt_messages[-1]["content"] = ""
-    if use_chat and hasattr(tokenizer, "apply_chat_template"):
-        return _format_messages_with_template(tokenizer, prompt_messages, add_generation_prompt=False)
+    if use_template and hasattr(tokenizer, "apply_chat_template"):
+        formatted_message = _format_messages_with_template(tokenizer, prompt_messages, add_generation_prompt=False)
+        return formatted_message.rsplit("<|im_end|>\n", 1)[0] # remove "<|im_end|>\n"
     return _format_messages_fallback(prompt_messages)
 
 
 def make_collate_fn(
     tokenizer,
-    use_chat: bool = True,
+    use_template: bool = True,
     mask_prompts: bool = False,
     max_length: Optional[int] = None,
+    model_name: Optional[str] = None,
 ) -> Callable[[List[Any]], Dict[str, torch.Tensor]]:
     pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
 
@@ -73,13 +75,17 @@ def make_collate_fn(
                 full_text = messages
                 prompt_len = 0
             else:
-                full_text = _build_text(tokenizer, messages, use_chat=use_chat)
+                full_text = _build_text(tokenizer, messages, use_template=use_template)
                 prompt_len = 0
                 if mask_prompts:
-                    prompt_text = _build_prompt_text(tokenizer, messages, use_chat=use_chat)
-                    prompt_len = len(
-                        tokenizer(prompt_text, add_special_tokens=False).input_ids
-                    )
+                    if model_name == "qwen":
+                        prompt_text = _build_prompt_text_qwen(tokenizer, messages, use_template=use_template)
+                    else:
+                        print("currently only qwen model is supported for prompt length calculation when mask_prompts is True.")
+                        prompt_text = _build_text(tokenizer, messages, use_template=use_template)
+                prompt_len = len(
+                    tokenizer(prompt_text, add_special_tokens=False).input_ids
+                )
 
             encoded = tokenizer(full_text, add_special_tokens=False)
             input_ids = torch.tensor(encoded["input_ids"], dtype=torch.long)

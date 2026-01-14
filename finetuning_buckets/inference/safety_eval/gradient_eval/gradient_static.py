@@ -14,7 +14,7 @@ import torch.nn as nn
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from trak.projectors import CudaProjector, ProjectionType
+from trak.projectors import CudaProjector
 import torch.nn.functional as F
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -36,6 +36,7 @@ from finetuning_buckets.inference.safety_eval.utils import (
 from finetuning_buckets.inference.safety_eval.gradient_eval.gradient_utils import (
     get_trak_projector,
     get_fastjl_projector,
+    project,
 )
 
 def obtain_gradients(model: nn.Module, tokenizer: AutoTokenizer, batch: dict) -> torch.Tensor:
@@ -162,7 +163,7 @@ def get_full_project_gradient(
                 current_gradient = torch.stack(gradients_list, dim=0)  # (project_interval, num_params)
             else:
                 current_gradient = torch.empty(0, device=device)
-            projected_gradient = project_gradient(
+            projected_gradient = project(
                 current_gradient,
                 projector_cls=projector_cls,
                 proj_dim=proj_dim,
@@ -190,46 +191,6 @@ def get_full_project_gradient(
         return _gather_projected(normalized_gradients, rank, world_size)
 
     return normalized_gradients
-
-
-def project_gradient(
-    gradient: torch.Tensor,
-    projector_cls: Optional[CudaProjector],
-    proj_dim: int,
-    device: torch.device,
-    dtype: torch.dtype,
-    block_size: int,
-    projector_type: str = "trak",
-    fastjl_projector: Optional[Callable[[torch.Tensor, int, int], torch.Tensor]] = None,
-) -> torch.Tensor:
-    """Project high-dimensional gradient matrix to lower dimension with TRAK projector.
-
-    gradient: (num_batches, num_params)
-    returns: (num_batches, proj_dim) on CPU
-    """
-    if projector_type == "fastjl":
-        if fastjl_projector is None:
-            raise ValueError("fastjl_projector is required when projector_type='fastjl'")
-        gradient = gradient.to(device=device, dtype=dtype)
-        projected = fastjl_projector(gradient, proj_dim, 0)
-        return projected.cpu()
-
-    if projector_cls is None:
-        raise ValueError("projector_cls is required when projector_type='trak'")
-    proj = projector_cls(
-        grad_dim=gradient.shape[1],
-        proj_dim=proj_dim,
-        seed=0,
-        proj_type=ProjectionType.rademacher,
-        device=device,
-        dtype=dtype,
-        block_size=block_size,
-        max_batch_size=8,
-    )
-    gradient = gradient.to(device=device, dtype=dtype)
-    projected = proj.project(gradient, model_id=0)
-    return projected.cpu()
-
 
 
 
@@ -285,7 +246,7 @@ class GradientStaticEvaluator:
             eval_dataloader,
             self.model,
             self.tokenizer,
-            project_interval=5,
+            project_interval=20,
             proj_dim=self.proj_dim,
             dtype=self.dtype,
             block_size=self.block_size,
@@ -309,7 +270,7 @@ class GradientStaticEvaluator:
             eval_dataloader,
             self.model,
             self.tokenizer,
-            project_interval=5,
+            project_interval=20,
             proj_dim=self.proj_dim,
             dtype=self.dtype,
             block_size=self.block_size,
